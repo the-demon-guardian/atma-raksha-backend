@@ -51,6 +51,7 @@ async function initSchema() {
       disguise_unlock_code TEXT,
       disguise_unlock_operator TEXT,
       checkin_interval_minutes INTEGER DEFAULT 60,
+      security_pin_hash TEXT,
       language TEXT DEFAULT 'en',
       photo_path TEXT,
       created_at TEXT DEFAULT (datetime('now'))
