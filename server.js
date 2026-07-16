@@ -11,7 +11,7 @@ const voiceRoutes = require("./routes/voice");
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: "8mb" })); // raised from default ~100kb to fit base64 photo attachments
 
 // Health check - also used by the free uptime-ping service (see README)
 // to keep the server awake and prevent it spinning down mid-escalation.
