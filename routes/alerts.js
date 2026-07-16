@@ -1,9 +1,10 @@
 const express = require("express");
+const bcrypt = require("bcryptjs");
 const { v4: uuidv4 } = require("uuid");
 const db = require("../db/db");
 const { requireAuth } = require("../services/authMiddleware");
 const { sendSMS, sendWhatsApp, placeEmergencyCall } = require("../services/twilioService");
-const { sendEmail } = require("../services/emailService");
+const { sendEmail, buildAlertEmailHtml } = require("../services/emailService");
 
 const router = express.Router();
 
@@ -22,13 +23,11 @@ async function logActivity(alertId, userId, action, detail, success = true) {
 }
 
 function buildAlertMessage(user, alert) {
-  const mapsLink =
-    alert.latitude && alert.longitude
-      ? `https://maps.google.com/?q=${alert.latitude},${alert.longitude}`
-      : "location unavailable";
+  const publicServerUrl = process.env.PUBLIC_SERVER_URL || `http://localhost:${process.env.PORT || 4000}`;
+  const liveLink = `${publicServerUrl}/live-location/${alert.id}`;
   return (
     `🚨 EMERGENCY ALERT — ${user.full_name || "Atma Raksha AI user"}\n` +
-    `Live location: ${mapsLink}\n` +
+    `Live location (updates automatically): ${liveLink}\n` +
     `Battery: ${alert.battery_percent ?? "unknown"}%\n` +
     `Please respond immediately or contact local emergency services.`
   );
@@ -42,6 +41,14 @@ async function withRetry(fn, maxAttempts = 3, delayMs = 3000) {
     if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, delayMs));
   }
   return { ...lastResult, attempts: maxAttempts };
+}
+
+async function getActivityLogSummary(alertId) {
+  const rows = await db.all(
+    "SELECT action, detail, created_at FROM activity_logs WHERE alert_id = ? ORDER BY created_at ASC",
+    [alertId]
+  );
+  return rows.map((r) => `[${r.created_at}] ${r.action}: ${r.detail}`);
 }
 
 async function notifyLevel(alert, user, level) {
@@ -69,7 +76,18 @@ async function notifyLevel(alert, user, level) {
   await logActivity(alert.id, user.id, "call_placed", `to ${targetNumber} (attempts: ${callResult.attempts}): ${callResult.success ? "ok" : callResult.error}`, callResult.success);
 
   if (user.emergency_email) {
-    const emailResult = await withRetry(() => sendEmail(user.emergency_email, "🚨 Emergency Alert - Atma Raksha AI", message));
+    const publicServerUrl = process.env.PUBLIC_SERVER_URL || `http://localhost:${process.env.PORT || 4000}`;
+    const liveLink = `${publicServerUrl}/live-location/${alert.id}`;
+    const activityLog = await getActivityLogSummary(alert.id);
+    const html = buildAlertEmailHtml({
+      personName: user.full_name || "Atma Raksha AI user",
+      timeStr: new Date().toLocaleString(),
+      mapsLink: liveLink,
+      batteryPercent: alert.battery_percent,
+      escalationLevel: level,
+      activityLog,
+    });
+    const emailResult = await withRetry(() => sendEmail(user.emergency_email, "🚨 Emergency Alert - Atma Raksha AI", message, html));
     await logActivity(alert.id, user.id, "email_sent", `to ${user.emergency_email} (attempts: ${emailResult.attempts}): ${emailResult.success ? "ok" : emailResult.error}`, emailResult.success);
   }
 }
@@ -127,7 +145,8 @@ router.post("/trigger-alert", requireAuth, async (req, res) => {
     await notifyLevel(alert, user, 0);
     scheduleEscalationCheck(id);
 
-    res.json({ success: true, alertId: id, status: "Emergency", escalationLevel: 0 });
+    const nextEscalationAt = new Date(Date.now() + ESCALATION_DELAY_MS).toISOString();
+    res.json({ success: true, alertId: id, status: "Emergency", escalationLevel: 0, nextEscalationAt });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -151,12 +170,23 @@ router.post("/mark-safe", requireAuth, async (req, res) => {
 });
 
 // ---------- GET /alert-status?alertId=... ----------
+// Includes nextEscalationAt (ISO timestamp) and a formatted activityLog
+// array, so the app can show a live countdown + activity feed like the
+// dashboard's "Escalating to Contact 2 in 1:58" display.
 router.get("/alert-status", requireAuth, async (req, res) => {
   try {
     const { alertId } = req.query;
     const alert = await db.get("SELECT * FROM alerts WHERE id = ? AND user_id = ?", [alertId, req.userId]);
     if (!alert) return res.status(404).json({ success: false, error: "Alert not found" });
-    res.json({ success: true, alert });
+
+    let nextEscalationAt = null;
+    if (alert.status === "Emergency" && alert.escalation_level < 2) {
+      const updatedAtMs = new Date(alert.updated_at + "Z").getTime(); // SQLite datetime('now') is UTC
+      nextEscalationAt = new Date(updatedAtMs + ESCALATION_DELAY_MS).toISOString();
+    }
+
+    const activityLog = await getActivityLogSummary(alertId);
+    res.json({ success: true, alert, nextEscalationAt, activityLog });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -173,13 +203,134 @@ router.get("/alert-history", requireAuth, async (req, res) => {
 });
 
 // ---------- POST /checkin ----------
+// Now requires the user's security PIN, matching the scheduled check-in flow:
+// body: { pin: "1234" }
 router.post("/checkin", requireAuth, async (req, res) => {
   try {
+    const { pin } = req.body;
+    const user = await db.get("SELECT security_pin_hash FROM users WHERE id = ?", [req.userId]);
+
+    if (!user) return res.status(404).json({ success: false, error: "User not found" });
+
+    // If the user never set a PIN, allow check-in without one (keeps the
+    // simple silent background ping working for users who haven't opted
+    // into scheduled PIN check-ins yet).
+    if (user.security_pin_hash) {
+      if (!pin) {
+        return res.status(400).json({ success: false, error: "PIN required to confirm check-in" });
+      }
+      const valid = bcrypt.compareSync(String(pin), user.security_pin_hash);
+      if (!valid) {
+        return res.status(401).json({ success: false, error: "Incorrect PIN" });
+      }
+    }
+
     await db.run("INSERT INTO checkins (id, user_id) VALUES (?, ?)", [uuidv4(), req.userId]);
     res.json({ success: true, checkedInAt: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// ---------- POST /update-location ----------
+// Called by the app every ~30-60s WHILE an emergency is active, to keep the
+// alert's location fresh so the live-location page actually moves.
+// body: { alertId, latitude, longitude }
+router.post("/update-location", requireAuth, async (req, res) => {
+  try {
+    const { alertId, latitude, longitude } = req.body;
+    if (!alertId || latitude == null || longitude == null) {
+      return res.status(400).json({ success: false, error: "alertId, latitude, longitude are required" });
+    }
+    const alert = await db.get("SELECT * FROM alerts WHERE id = ? AND user_id = ?", [alertId, req.userId]);
+    if (!alert) return res.status(404).json({ success: false, error: "Alert not found" });
+    if (alert.status !== "Emergency") {
+      return res.status(400).json({ success: false, error: "Alert is not active" });
+    }
+
+    await db.run(
+      "UPDATE alerts SET latitude = ?, longitude = ?, updated_at = datetime('now') WHERE id = ?",
+      [latitude, longitude, alertId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ---------- GET /live-location-data/:alertId ----------
+// PUBLIC (no login) - the alertId itself (a random UUID) is the access
+// token, same security model as a typical "share my location" link. Only
+// returns the minimum needed to render a map: coordinates, status, and
+// when it was last updated - never the full user profile.
+router.get("/live-location-data/:alertId", async (req, res) => {
+  try {
+    const alert = await db.get(
+      "SELECT latitude, longitude, status, battery_percent, updated_at FROM alerts WHERE id = ?",
+      [req.params.alertId]
+    );
+    if (!alert) return res.status(404).json({ success: false, error: "Not found" });
+    res.json({ success: true, ...alert });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ---------- GET /live-location/:alertId ----------
+// PUBLIC - a simple, no-login, auto-refreshing page an emergency contact can
+// open straight from the SMS/WhatsApp/email link. Re-fetches the latest
+// coordinates every 10 seconds and re-centers an embedded Google Map.
+router.get("/live-location/:alertId", (req, res) => {
+  const alertId = req.params.alertId;
+  res.set("Content-Type", "text/html");
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Atma Raksha AI — Live Location</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f5f5f5; }
+    #banner { background: #C62828; color: #fff; padding: 14px 16px; font-size: 16px; }
+    #status { padding: 12px 16px; font-size: 14px; color: #444; background: #fff; border-bottom: 1px solid #eee; }
+    #map { width: 100%; height: 80vh; border: 0; }
+  </style>
+</head>
+<body>
+  <div id="banner">🚨 Live location — updates automatically every 10 seconds</div>
+  <div id="status">Loading…</div>
+  <iframe id="map"></iframe>
+  <script>
+    const alertId = ${JSON.stringify(alertId)};
+    async function refresh() {
+      try {
+        const res = await fetch('/live-location-data/' + alertId);
+        const data = await res.json();
+        if (!data.success) {
+          document.getElementById('status').textContent = 'This link is no longer valid.';
+          return;
+        }
+        const statusEl = document.getElementById('status');
+        if (data.latitude && data.longitude) {
+          statusEl.textContent = 'Status: ' + data.status + ' — Battery: ' + (data.battery_percent ?? '?') +
+            '% — Last updated: ' + new Date(data.updated_at + 'Z').toLocaleTimeString();
+          document.getElementById('map').src =
+            'https://maps.google.com/maps?q=' + data.latitude + ',' + data.longitude + '&z=16&output=embed';
+        } else {
+          statusEl.textContent = 'Waiting for location data…';
+        }
+        if (data.status === 'Normal') {
+          statusEl.textContent += ' (Marked safe — no longer an active emergency)';
+        }
+      } catch (e) {
+        document.getElementById('status').textContent = 'Connection error, retrying…';
+      }
+    }
+    refresh();
+    setInterval(refresh, 10000);
+  </script>
+</body>
+</html>`);
 });
 
 module.exports = router;
