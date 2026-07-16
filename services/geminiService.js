@@ -6,16 +6,30 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 /**
  * Send a chat message to Gemini and return the text reply.
  * history: array of { role: 'user'|'model', text: string }  (optional, for context)
+ * imageBase64 / imageMimeType: optional - attaches a photo to THIS message only
+ * (Gemini's multimodal input, sent as inline base64 data - fine for a single
+ * photo per message; NOT used for video/large files, which need a separate,
+ * heavier upload flow this MVP does not implement).
  */
-async function chatWithGemini(userMessage, history = []) {
+async function chatWithGemini(userMessage, history = [], imageBase64 = null, imageMimeType = null) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+  const userParts = [{ text: userMessage || "(Image attached, no caption)" }];
+  if (imageBase64 && imageMimeType) {
+    userParts.push({
+      inline_data: {
+        mime_type: imageMimeType,
+        data: imageBase64,
+      },
+    });
+  }
 
   const contents = [
     ...history.map((h) => ({
       role: h.role === "model" ? "model" : "user",
       parts: [{ text: h.text }],
     })),
-    { role: "user", parts: [{ text: userMessage }] },
+    { role: "user", parts: userParts },
   ];
 
   const body = {
