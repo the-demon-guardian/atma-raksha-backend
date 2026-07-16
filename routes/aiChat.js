@@ -5,12 +5,15 @@ const { chatWithGemini } = require("../services/geminiService");
 const router = express.Router();
 
 // ---------- POST /ai-chat ----------
-// body: { message: "...", history?: [{role, text}, ...] }
+// body: { message: "...", history?: [{role, text}, ...], imageBase64?: "...", imageMimeType?: "image/jpeg" }
+// A message needs EITHER text OR an image (or both) - not neither.
 router.post("/ai-chat", requireAuth, async (req, res) => {
-  const { message, history } = req.body;
-  if (!message) return res.status(400).json({ success: false, error: "message is required" });
+  const { message, history, imageBase64, imageMimeType } = req.body;
+  if (!message && !imageBase64) {
+    return res.status(400).json({ success: false, error: "message or imageBase64 is required" });
+  }
 
-  const result = await chatWithGemini(message, history || []);
+  const result = await chatWithGemini(message || "", history || [], imageBase64 || null, imageMimeType || null);
   res.json(result);
 });
 
