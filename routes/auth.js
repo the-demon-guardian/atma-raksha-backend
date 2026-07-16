@@ -3,10 +3,28 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { v4: uuidv4 } = require("uuid");
 const db = require("../db/db");
+const { requireAuth } = require("../services/authMiddleware");
 const { sendOtp, checkOtp } = require("../services/twilioService");
 const { sendEmailOtp } = require("../services/emailService");
 
 const router = express.Router();
+
+// ---------- POST /auth/set-pin ----------
+// Sets/changes the 4-digit security PIN used to confirm scheduled check-ins.
+// body: { pin: "1234" }
+router.post("/set-pin", requireAuth, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    if (!pin || !/^\d{4}$/.test(String(pin))) {
+      return res.status(400).json({ success: false, error: "PIN must be exactly 4 digits" });
+    }
+    const pinHash = bcrypt.hashSync(String(pin), 10);
+    await db.run("UPDATE users SET security_pin_hash = ? WHERE id = ?", [pinHash, req.userId]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 // Simple in-memory store for email OTPs: { email: { code, expiresAt } }
 // Fine for MVP demo purposes; a production system should persist this.
@@ -53,11 +71,28 @@ router.post("/verify-otp", async (req, res) => {
 });
 
 // ---------- POST /auth/signup ----------
+// NOTE: There is no longer a separate password. The account's login
+// credential IS whatever disguise-unlock method is set up here (a 3-digit
+// code or a long-press operator) - that same credential unlocks the
+// calculator disguise AND logs the user in, in one action. Fingerprint/face
+// unlock, if also enabled, is a LOCAL-ONLY convenience layered on top (it
+// can never independently restore a session after logout/reinstall, since
+// biometric data never leaves the device - the code/long-press remains the
+// one recoverable credential).
 router.post("/signup", async (req, res) => {
   try {
     const b = req.body;
-    if (!b.primary_mobile || !b.password) {
-      return res.status(400).json({ success: false, error: "primary_mobile and password are required" });
+    if (!b.primary_mobile) {
+      return res.status(400).json({ success: false, error: "primary_mobile is required" });
+    }
+    if (b.disguise_unlock_type !== "code" && b.disguise_unlock_type !== "longpress") {
+      return res.status(400).json({ success: false, error: "A 3-digit code or long-press unlock method is required" });
+    }
+    if (b.disguise_unlock_type === "code" && !b.disguise_unlock_code) {
+      return res.status(400).json({ success: false, error: "disguise_unlock_code is required for code unlock" });
+    }
+    if (b.disguise_unlock_type === "longpress" && !b.disguise_unlock_operator) {
+      return res.status(400).json({ success: false, error: "disguise_unlock_operator is required for long-press unlock" });
     }
 
     const existing = await db.get("SELECT id FROM users WHERE primary_mobile = ?", [b.primary_mobile]);
@@ -66,10 +101,13 @@ router.post("/signup", async (req, res) => {
     }
 
     const id = uuidv4();
-    const passwordHash = bcrypt.hashSync(b.password, 10);
+    // password_hash is kept in the schema for backward compatibility but is
+    // no longer collected or required - the disguise-unlock credential is
+    // now the sole login mechanism.
+    const passwordHash = b.password ? bcrypt.hashSync(b.password, 10) : null;
 
     let disguiseCodeHash = null;
-    if (b.disguise_unlock_type === "code" && b.disguise_unlock_code) {
+    if (b.disguise_unlock_type === "code") {
       disguiseCodeHash = bcrypt.hashSync(String(b.disguise_unlock_code), 10);
     }
 
@@ -106,8 +144,8 @@ router.post("/signup", async (req, res) => {
         b.emergency_mobile_2 || null,
         b.emergency_email || null,
         passwordHash,
-        b.disguise_enabled ? 1 : 0,
-        b.disguise_unlock_type || null,
+        1, // disguise_enabled is always true now - it IS the login mechanism, not optional
+        b.disguise_unlock_type,
         disguiseCodeHash,
         b.disguise_unlock_operator || null,
         b.checkin_interval_minutes || 60,
@@ -124,11 +162,15 @@ router.post("/signup", async (req, res) => {
 });
 
 // ---------- POST /auth/login ----------
+// RETAINED but no longer used by the app - kept harmlessly for backward
+// compatibility. Since accounts created via the new flow have no password
+// (password_hash is null), this will simply fail for them, which is
+// correct and expected.
 router.post("/login", async (req, res) => {
   try {
     const { primary_mobile, password } = req.body;
     const user = await db.get("SELECT * FROM users WHERE primary_mobile = ?", [primary_mobile]);
-    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    if (!user || !user.password_hash || !bcrypt.compareSync(password, user.password_hash)) {
       return res.status(401).json({ success: false, error: "Invalid mobile number or password" });
     }
     const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: "30d" });
@@ -139,25 +181,50 @@ router.post("/login", async (req, res) => {
 });
 
 // ---------- POST /auth/verify-disguise-unlock ----------
+// This IS the login action now - a successful code/long-press match issues
+// a real login token, same as signup does. Fingerprint success is verified
+// entirely on-device (see BiometricHelper.kt) and never reaches this
+// endpoint at all - it only works while a token is already stored locally.
 router.post("/verify-disguise-unlock", async (req, res) => {
   try {
     const { userId, type, code, operator } = req.body;
     const user = await db.get("SELECT * FROM users WHERE id = ?", [userId]);
     if (!user) return res.status(404).json({ success: false, error: "User not found" });
 
+    let ok = false;
     if (type === "code" && user.disguise_unlock_type === "code") {
-      const ok = bcrypt.compareSync(String(code || ""), user.disguise_unlock_code || "");
-      return res.json({ success: ok });
+      ok = bcrypt.compareSync(String(code || ""), user.disguise_unlock_code || "");
+    } else if (type === "longpress" && user.disguise_unlock_type === "longpress") {
+      ok = operator === user.disguise_unlock_operator;
     }
-    if (type === "longpress" && user.disguise_unlock_type === "longpress") {
-      const ok = operator === user.disguise_unlock_operator;
-      return res.json({ success: ok });
+
+    if (!ok) {
+      return res.json({ success: false });
     }
-    res.json({ success: false });
+
+    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: "30d" });
+    res.json({ success: true, token, userId: user.id });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ---------- GET /auth/me ----------
+// Returns the logged-in user's own profile, excluding sensitive fields
+// (password_hash, security_pin_hash, disguise_unlock_code are never sent).
+router.get("/me", requireAuth, async (req, res) => {
+  try {
+    const user = await db.get(
+      `SELECT id, full_name, primary_mobile, email, emergency_mobile_1, emergency_mobile_2,
+              emergency_email, disguise_enabled, checkin_interval_minutes, language, photo_path
+       FROM users WHERE id = ?`,
+      [req.userId]
+    );
+    if (!user) return res.status(404).json({ success: false, error: "User not found" });
+    res.json({ success: true, user });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
 module.exports = router;
-            
