@@ -1,26 +1,46 @@
-const nodemailer = require("nodemailer");
+// EMAIL SERVICE - Brevo HTTP API (NOT SMTP/nodemailer)
+//
+// WHY THIS CHANGED: Render blocks outbound SMTP traffic (ports 25/465/587)
+// on free-tier web services, as of September 26, 2025 - this is a Render
+// platform policy, not a bug in this code. Nodemailer + Gmail SMTP simply
+// cannot work on Render's free tier at all, regardless of how correctly
+// it's configured. Brevo sends email over regular HTTPS (port 443), which
+// is never blocked, so this is the actual fix rather than a workaround.
+//
+// Setup required: a free Brevo account (brevo.com), a verified sender
+// email, and an API key - see BREVO_API_KEY in .env.example.
 
-// Uses Gmail + an App Password (never the main account password).
-// EMAIL_USER and EMAIL_APP_PASSWORD are read from environment variables only -
-// set them in Render's Environment tab, never in this file or in chat.
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_APP_PASSWORD,
-  },
-});
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL; // must be verified in Brevo
+const BREVO_SENDER_NAME = "Atma Raksha AI";
 
 async function sendEmail(toEmail, subject, message, htmlBody = null) {
   if (!toEmail) return { success: false, error: "No recipient email configured" };
+  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) {
+    return { success: false, error: "BREVO_API_KEY or BREVO_SENDER_EMAIL not configured" };
+  }
+
   try {
-    await transporter.sendMail({
-      from: `"Atma Raksha AI" <${process.env.EMAIL_USER}>`,
-      to: toEmail,
-      subject,
-      text: message,
-      html: htmlBody || undefined, // falls back to plain text if no HTML given
+    const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        "api-key": BREVO_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+      },
+      body: JSON.stringify({
+        sender: { email: BREVO_SENDER_EMAIL, name: BREVO_SENDER_NAME },
+        to: [{ email: toEmail }],
+        subject,
+        textContent: message,
+        htmlContent: htmlBody || `<pre>${message}</pre>`,
+      }),
     });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      return { success: false, error: `Brevo API error (${res.status}): ${errBody}` };
+    }
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
@@ -30,7 +50,7 @@ async function sendEmail(toEmail, subject, message, htmlBody = null) {
 /**
  * Builds a styled HTML emergency alert email - a red header banner, a clean
  * info table (Person / Time / Location / Battery / Alert Level), and an
- * activity log section, matching the layout used elsewhere in the app.
+ * activity log section.
  */
 function buildAlertEmailHtml({ personName, timeStr, mapsLink, batteryPercent, escalationLevel, activityLog }) {
   const levelLabels = { 0: "Level 0 - Emergency Contact 1", 1: "Level 1 - Emergency Contact 2", 2: "Level 2 - Police Helpline" };
